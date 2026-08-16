@@ -22,14 +22,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from fx_phase_rail import EPS, TORCH_OK, TorchGaborPyramid
-
-if TORCH_OK:  # pragma: no branch
-    import torch
-    import torch.nn.functional as F
-else:  # pragma: no cover
-    torch = None
-    F = None
+EPS = 1e-7
 
 
 def identity_map(h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
@@ -70,7 +63,7 @@ def fullres_gather_from_rail_map(
 ) -> np.ndarray:
     """Gather the original full-resolution anchor using a low-res address map.
 
-    The PhaseRail motion solver runs on a square letterboxed rail.  We convert
+    The PhaseRail motion solver runs on a square letterboxed rail. We convert
     the accumulated rail displacement (map - identity) back to full-frame pixel
     units, then remap the pristine full-resolution anchor exactly once.
     """
@@ -102,14 +95,24 @@ class AddressMetrics:
 
 
 class AnchorAddressRail:
-    """Use PhaseRail only as a motion sensor; evolve an address field instead."""
+    """Use PhaseRail only as a motion sensor; evolve an address field instead.
+
+    Torch and fx_phase_rail are imported lazily so the pure address-field math
+    remains testable on a CPU-only CI runner.
+    """
 
     def __init__(self, size: int = 128, device: str = "cuda") -> None:
-        if not TORCH_OK:
-            raise RuntimeError("AnchorGather requires torch")
+        try:
+            import torch
+            import torch.nn.functional as F
+            from fx_phase_rail import TorchGaborPyramid
+        except Exception as exc:  # pragma: no cover - user runtime path
+            raise RuntimeError(f"AnchorGather requires working torch PhaseRail: {exc}") from exc
+        self.torch = torch
+        self.F = F
         self.p = TorchGaborPyramid(size=size, orientations=6, device=device)
         self.previous_source_z: Optional[object] = None
-        self.map_field: Optional[object] = None  # [2,H,W], pixel coordinates in anchor rail
+        self.map_field: Optional[object] = None  # [2,H,W], anchor pixel coordinates
         self._identity: Optional[object] = None
 
     @property
@@ -124,6 +127,7 @@ class AnchorAddressRail:
     def _ensure_map(self):
         if self.map_field is not None:
             return
+        torch = self.torch
         H = self.p.size
         yy, xx = torch.meshgrid(
             torch.arange(H, device=self.p.device, dtype=torch.float32),
@@ -134,6 +138,7 @@ class AnchorAddressRail:
         self.map_field = self._identity.clone()
 
     def _sample_map(self, sx, sy):
+        torch, F = self.torch, self.F
         H = self.p.size
         gx = 2.0 * sx / max(H - 1, 1) - 1.0
         gy = 2.0 * sy / max(H - 1, 1) - 1.0
@@ -143,45 +148,44 @@ class AnchorAddressRail:
             padding_mode="border", align_corners=True,
         )[0]
 
-    @torch.no_grad()
     def process(self, source_bgr: np.ndarray, max_displacement: float = 3.5):
-        self._ensure_map()
-        p = self.p
-        src = p.to_device(np.ascontiguousarray(source_bgr.astype(np.float32)))
-        gray = 0.0722 * src[..., 0] + 0.7152 * src[..., 1] + 0.2126 * src[..., 2]
-        source_z, _, _ = p.analyze_gray(gray)
+        torch = self.torch
+        with torch.no_grad():
+            self._ensure_map()
+            p = self.p
+            src = p.to_device(np.ascontiguousarray(source_bgr.astype(np.float32)))
+            gray = 0.0722 * src[..., 0] + 0.7152 * src[..., 1] + 0.2126 * src[..., 2]
+            source_z, _, _ = p.analyze_gray(gray)
 
-        if self.previous_source_z is None:
-            dx = torch.zeros_like(gray)
-            dy = torch.zeros_like(gray)
-            confidence = torch.zeros_like(gray)
-        else:
-            dx, dy, confidence, _ = p.estimate_bound_phase_flow(
-                source_z, self.previous_source_z, max_displacement
-            )
-            # Mirror the confidence gating used for PhaseRail's predicted phase.
-            gate = (confidence * 1.75).clamp(0.0, 1.0)
-            dx = dx * gate
-            dy = dy * gate
-            yy, xx = torch.meshgrid(
-                torch.arange(p.size, device=p.device, dtype=torch.float32),
-                torch.arange(p.size, device=p.device, dtype=torch.float32),
-                indexing="ij",
-            )
-            self.map_field = self._sample_map(xx + dx, yy + dy)
+            if self.previous_source_z is None:
+                dx = torch.zeros_like(gray)
+                dy = torch.zeros_like(gray)
+                confidence = torch.zeros_like(gray)
+            else:
+                dx, dy, confidence, _ = p.estimate_bound_phase_flow(
+                    source_z, self.previous_source_z, max_displacement
+                )
+                # Mirror the confidence gating used for PhaseRail's predicted phase.
+                gate = (confidence * 1.75).clamp(0.0, 1.0)
+                dx = dx * gate
+                dy = dy * gate
+                yy, xx = torch.meshgrid(
+                    torch.arange(p.size, device=p.device, dtype=torch.float32),
+                    torch.arange(p.size, device=p.device, dtype=torch.float32),
+                    indexing="ij",
+                )
+                self.map_field = self._sample_map(xx + dx, yy + dy)
 
-        disp = self.map_field - self._identity
-        # A cheap map-distortion diagnostic: local finite-difference departure
-        # from identity.  This is geometry/address health, not texture health.
-        dux_dx = disp[0, :, 1:] - disp[0, :, :-1]
-        duy_dy = disp[1, 1:, :] - disp[1, :-1, :]
-        stretch = 0.5 * (dux_dx.abs().mean() + duy_dy.abs().mean())
-        metrics = AddressMetrics(
-            motion=float(torch.sqrt(dx * dx + dy * dy).mean().item()),
-            confidence=float(confidence.mean().item()),
-            displacement=float(torch.sqrt(disp[0] ** 2 + disp[1] ** 2).mean().item()),
-            stretch=float(stretch.item()),
-        )
-        self.previous_source_z = source_z
-        field = self.map_field.detach().cpu().numpy().astype(np.float32)
+            disp = self.map_field - self._identity
+            dux_dx = disp[0, :, 1:] - disp[0, :, :-1]
+            duy_dy = disp[1, 1:, :] - disp[1, :-1, :]
+            stretch = 0.5 * (dux_dx.abs().mean() + duy_dy.abs().mean())
+            metrics = AddressMetrics(
+                motion=float(torch.sqrt(dx * dx + dy * dy).mean().item()),
+                confidence=float(confidence.mean().item()),
+                displacement=float(torch.sqrt(disp[0] ** 2 + disp[1] ** 2).mean().item()),
+                stretch=float(stretch.item()),
+            )
+            self.previous_source_z = source_z
+            field = self.map_field.detach().cpu().numpy().astype(np.float32)
         return field[0], field[1], metrics
