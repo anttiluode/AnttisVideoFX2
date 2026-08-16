@@ -1,0 +1,27 @@
+name: anchor-hybrid-ci
+
+on:
+  push:
+    paths:
+      - 'anchor_hybrid.py'
+      - 'fx_anchor_hybrid.py'
+      - 'ai_video_fx_hybrid.py'
+      - 'run_anchor_hybrid.bat'
+      - 'ANCHOR_HYBRID.md'
+      - 'test_anchor_hybrid.py'
+      - 'detail_metabolism.py'
+      - 'anchor_gather.py'
+      - '.github/workflows/anchor-hybrid-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install numpy opencv-python-headless
+      - run: python -m unittest test_anchor_hybrid -v
