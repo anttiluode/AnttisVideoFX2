@@ -1,0 +1,33 @@
+name: detail-metabolism-ci
+
+on:
+  push:
+    paths:
+      - 'detail_metabolism.py'
+      - 'detail_metabolism_patch.py'
+      - 'fx_detail_metabolism.py'
+      - 'ai_video_fx_metabolism.py'
+      - 'test_detail_metabolism.py'
+      - '.github/workflows/detail-metabolism-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install numpy opencv-python-headless
+      - run: python -m unittest test_detail_metabolism -v
+      - name: registration smoke test
+        run: |
+          python - <<'PY'
+          import detail_metabolism_patch
+          import fx_detail_metabolism
+          from fx_core import PRESETS
+          assert 'Antti Detail Metabolism' in PRESETS
+          print('detail metabolism registration PASS')
+          PY
