@@ -1,6 +1,6 @@
 """Runtime patch adding a dedicated img2img detail-donor channel.
 
-Import this module *before* ai_video_fx.  It replaces fx_ai.DiffusionWorker with
+Import this module *before* ai_video_fx. It replaces fx_ai.DiffusionWorker with
 one compatible subclass that understands a fourth key, ``detail_donor``.
 
 The effect publishes:
@@ -9,6 +9,11 @@ The effect publishes:
 
 Settings for that one request live in store.state['_detail_request_cfg'] so the
 ordinary GUI/AIConfig does not need a second permanent diffusion panel.
+
+When a normal ``person_style`` keyframe is generated, its prompt/negative prompt
+are frozen into store.state as the donor anchor prompt. Later text edits do not
+silently alter metabolism donors; pressing Generate person intentionally creates
+a new anchor and therefore a new frozen donor prompt.
 """
 from __future__ import annotations
 
@@ -39,9 +44,15 @@ class MetabolismDiffusionWorker(BaseDiffusionWorker):
         if key != "detail_donor":
             return super()._channel(key)
         d = self._detail_cfg()
+        anchor_prompt = str(
+            self.store.state.get("_detail_anchor_prompt", self.cfg.person_prompt)
+        )
+        anchor_negative = str(
+            self.store.state.get("_detail_anchor_negative", self.cfg.person_negative)
+        )
         return dict(
-            prompt=str(d.get("prompt", self.cfg.person_prompt)),
-            negative=str(d.get("negative", self.cfg.person_negative)),
+            prompt=str(d.get("prompt", anchor_prompt)),
+            negative=str(d.get("negative", anchor_negative)),
             strength=float(d.get("strength", 0.32)),
             steps=int(d.get("steps", max(4, int(self.cfg.layer_steps)))),
             guidance=float(d.get("guidance", self.cfg.layer_guidance)),
@@ -96,7 +107,7 @@ class MetabolismDiffusionWorker(BaseDiffusionWorker):
         if generator is not None:
             kwargs["generator"] = generator
 
-        # Capture request id immediately before the expensive call.  If the
+        # Capture request id immediately before the expensive call. If the
         # effect keeps updating detail_request_image while we generate, this
         # donor still belongs to the request that caused this pass.
         req_stamp = float(self.store.stamp("detail_request"))
@@ -114,8 +125,15 @@ class MetabolismDiffusionWorker(BaseDiffusionWorker):
     def _run_channel(self, frame: np.ndarray, key: str, channel: dict) -> None:
         if key == "detail_donor":
             self._run_detail(key, channel)
-        else:
-            super()._run_channel(frame, key, channel)
+            return
+
+        super()._run_channel(frame, key, channel)
+        if key == "person_style" and self.store.get("person_style") is not None:
+            # Freeze the actual prompt which produced this accepted identity
+            # anchor. Donors reuse it until the user deliberately makes a new
+            # person keyframe.
+            self.store.state["_detail_anchor_prompt"] = str(channel["prompt"])
+            self.store.state["_detail_anchor_negative"] = str(channel["negative"])
 
     def run(self) -> None:
         order = ("style", "person_style", "background_style", "detail_donor")
