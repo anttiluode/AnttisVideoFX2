@@ -1,0 +1,23 @@
+name: anchor-gather-ci
+
+on:
+  push:
+    paths:
+      - 'anchor_gather.py'
+      - 'fx_anchor_gather.py'
+      - 'ai_video_fx_anchor.py'
+      - 'test_anchor_gather.py'
+      - '.github/workflows/anchor-gather-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install numpy opencv-python-headless
+      - run: python -m unittest test_anchor_gather -v
