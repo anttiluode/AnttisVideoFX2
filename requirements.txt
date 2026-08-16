@@ -1,0 +1,17 @@
+# core
+opencv-python>=4.8
+numpy>=1.24
+pillow>=10.0
+
+# AI maps and CUDA PhaseRail
+# Install the CUDA torch build appropriate for your system first when needed:
+# https://pytorch.org/get-started/locally/
+torch>=2.1
+transformers>=4.40
+
+# img2img generation for whole-frame Dream and the two prompted layers
+diffusers>=0.27
+accelerate>=0.27
+
+# tkinter ships with Python on Windows/macOS.
+# Debian/Ubuntu: sudo apt install python3-tk
