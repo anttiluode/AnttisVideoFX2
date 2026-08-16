@@ -1,0 +1,29 @@
+name: liveportrait-control-ci
+
+on:
+  push:
+    paths:
+      - 'cycle_consistency.py'
+      - 'fx_anchor_hybrid.py'
+      - 'liveportrait_bridge_patch.py'
+      - 'fx_liveportrait_assist.py'
+      - 'liveportrait_realtime_worker.py'
+      - 'transport_benchmark.py'
+      - 'test_cycle_consistency.py'
+      - 'test_liveportrait_bridge.py'
+      - 'test_transport_benchmark.py'
+      - '.github/workflows/liveportrait-control-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install numpy opencv-python-headless
+      - run: python -m unittest test_cycle_consistency test_transport_benchmark test_liveportrait_bridge -v
+      - run: python -m py_compile liveportrait_realtime_worker.py liveportrait_bridge_patch.py fx_liveportrait_assist.py transport_benchmark.py fx_anchor_hybrid.py
