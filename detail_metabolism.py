@@ -6,8 +6,8 @@ The question is deliberately narrower than generic motion error:
     generated person since its last accepted detail state?
 
 A fresh img2img result is treated as a *donor*, not as a replacement frame.
-The donor is first flow-aligned to the current carried image, then only its
-medium/fine Laplacian content is transplanted.  Coarse/low structure remains
+The donor is first aligned to the current carried image, then only its
+medium/fine Laplacian content is transplanted. Coarse/low structure remains
 owned by the living carrier.
 """
 from __future__ import annotations
@@ -126,51 +126,79 @@ def _normalize_masked(gray: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
     return (g - mean) / max(0.03, std)
 
 
+def _masked_for_alignment(
+    gray: np.ndarray,
+    mask: np.ndarray | None,
+) -> np.ndarray:
+    g = np.asarray(gray, np.float32)
+    if mask is None:
+        return g
+    m = np.clip(np.asarray(mask, np.float32), 0.0, 1.0)
+    if m.shape != g.shape:
+        m = cv2.resize(m, (g.shape[1], g.shape[0]), interpolation=cv2.INTER_LINEAR)
+    m = _gauss(m, 2.0)
+    vals = g[m > 0.15]
+    neutral = float(np.mean(vals)) if vals.size else float(np.mean(g))
+    return g * m + neutral * (1.0 - m)
+
+
 def align_donor_to_current(
     donor: np.ndarray,
     current: np.ndarray,
     mask: np.ndarray | None = None,
     max_flow: float = 18.0,
 ) -> tuple[np.ndarray, float]:
-    """Dense-flow warp donor into the current carrier's coordinate frame.
+    """Warp donor into the current carrier's coordinate frame.
 
-    Farneback is intentionally a cheap first attempt.  The donor was generated
-    from a recent carried frame, so this only needs to absorb the motion that
-    happened while diffusion was running, not solve arbitrary correspondence.
+    Two stages are used because the img2img donor can finish several video
+    frames after it was requested:
+
+    1. phase correlation absorbs the dominant global translation;
+    2. Farneback estimates a smaller dense residual on 8-bit normalized luma.
+
+    This is still deliberately cheap. It is not a face correspondence model.
     """
     cur = np.asarray(current, np.float32)
     don = np.asarray(donor, np.float32)
     if don.shape[:2] != cur.shape[:2]:
         don = cv2.resize(don, (cur.shape[1], cur.shape[0]), interpolation=cv2.INTER_LINEAR)
-    cg = _gauss(_gray(cur), 0.9)
-    dg = _gauss(_gray(don), 0.9)
-    if mask is not None:
-        m = np.clip(np.asarray(mask, np.float32), 0.0, 1.0)
-        if m.shape != cg.shape:
-            m = cv2.resize(m, (cg.shape[1], cg.shape[0]), interpolation=cv2.INTER_LINEAR)
-        m = _gauss(m, 2.0)
-        neutral_c = float(np.mean(cg[m > 0.15])) if np.any(m > 0.15) else float(np.mean(cg))
-        neutral_d = float(np.mean(dg[m > 0.15])) if np.any(m > 0.15) else float(np.mean(dg))
-        cg = cg * m + neutral_c * (1.0 - m)
-        dg = dg * m + neutral_d * (1.0 - m)
 
-    # Flow from current -> donor gives donor sampling coordinates for each
-    # current pixel: donor(x + flow_x, y + flow_y).
+    cg = _masked_for_alignment(_gauss(_gray(cur), 0.9), mask)
+    dg = _masked_for_alignment(_gauss(_gray(don), 0.9), mask)
+    h, w = cg.shape
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+
+    # cv2.phaseCorrelate(current, donor) returns the donor displacement.  To
+    # express donor in current coordinates, sample donor at x+dx, y+dy.
+    (dx0, dy0), response = cv2.phaseCorrelate(cg.astype(np.float32), dg.astype(np.float32))
+    max_global = max(2.0, float(max_flow) * 1.5)
+    dx0 = float(np.clip(dx0, -max_global, max_global))
+    dy0 = float(np.clip(dy0, -max_global, max_global))
+    global_aligned = cv2.remap(
+        don,
+        xx + dx0, yy + dy0,
+        cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT,
+    ).astype(np.float32)
+
+    gg = _masked_for_alignment(_gauss(_gray(global_aligned), 0.9), mask)
+    # Farneback on [0,1] images can underflow into effectively zero motion on
+    # OpenCV 5. Normalize to 8-bit before the residual flow solve.
+    c8 = np.clip((_normalize_masked(cg, mask) * 36.0) + 128.0, 0, 255).astype(np.uint8)
+    g8 = np.clip((_normalize_masked(gg, mask) * 36.0) + 128.0, 0, 255).astype(np.uint8)
     flow = cv2.calcOpticalFlowFarneback(
-        cg, dg, None, 0.5, 3, 21, 3, 5, 1.2, 0
+        c8, g8, None, 0.5, 3, 21, 3, 5, 1.2, 0
     ).astype(np.float32)
     mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
     limiter = np.maximum(1.0, mag / max(1.0, float(max_flow)))
     flow[..., 0] /= limiter
     flow[..., 1] /= limiter
-    h, w = cg.shape
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     warped = cv2.remap(
-        don,
+        global_aligned,
         xx + flow[..., 0], yy + flow[..., 1],
         cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT,
     )
-    return warped.astype(np.float32), float(np.mean(np.minimum(mag, max_flow)))
+    mean_motion = float(np.hypot(dx0, dy0) + np.mean(np.minimum(mag, max_flow)))
+    return warped.astype(np.float32), mean_motion
 
 
 def geometry_error(
