@@ -17,7 +17,6 @@ Those numbers are hypotheses exposed to the UI; they are not measured facts.
 """
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import numpy as np
@@ -113,7 +112,6 @@ class LayerPhaseRailLife:
         st = self.base.state
         if st.output_z is None or st.target_z is None:
             return [1.0] * 5
-        import torch
 
         p = self.base.p
         C = int(st.output_z.shape[0])
@@ -130,11 +128,15 @@ class LayerPhaseRailLife:
         return health
 
     def process(self, source_bgr: np.ndarray, **kwargs: Any):
-        # Repair from the previous frame's already-transported reference before
-        # applying this frame's motion.  Both repaired visible state and target
-        # then receive the same new phase increment in LayerPhaseRail.process().
+        # Age first.  That makes "life 8" mean the repair happens on the 8th
+        # rendered frame after anchoring, not the 9th.
+        self.scheduler.advance()
         due = self.scheduler.due() if self.repair_enabled else []
         repaired: list[int] = []
+
+        # Repair from the previous frame's already-transported reference before
+        # applying this frame's motion. Both repaired visible state and target
+        # then receive the same new phase increment in LayerPhaseRail.process().
         if self.base.state.output_z is not None and self.base.state.target_z is not None:
             for si in due:
                 self._relock_scale(si)
@@ -143,7 +145,6 @@ class LayerPhaseRailLife:
                 self.scheduler.repaired(repaired)
 
         out, coherence, metrics = self.base.process(source_bgr, **kwargs)
-        self.scheduler.advance()
         self.last_relocked = repaired
 
         scale_health = self._internal_scale_health()
