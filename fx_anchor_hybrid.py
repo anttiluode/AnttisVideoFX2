@@ -1,22 +1,21 @@
 """Confidence-gated Anchor Gather with donor soft re-anchoring.
 
 The first Anchor Gather experiment removed recursive blur but exposed the next
-failure cleanly: address drift.  A pristine generated face can remain sharp
+failure cleanly: address drift. A pristine generated face can remain sharp
 while its features, hands and silhouette are sampled from the wrong places,
 producing the characteristic Picasso-like failure.
 
-This sibling keeps the useful part of Anchor Gather and adds two controls:
+This sibling now has three independent correspondence receivers:
 
-1. Measure whether the accumulated current->anchor address field is still
-   locally believable (Jacobian strain/folding + transported ownership mask).
-2. Where it is not believable, suppress stale high-frequency anchor detail and
-   borrow only low-frequency structure from the live frame.
+1. local Jacobian strain/folding of the accumulated current->anchor map;
+2. transported old-person mask versus the present person mask;
+3. a long-range forward/backward optical-flow cycle that can reject a smooth
+   but wrong address field which the Jacobian cannot see.
 
-When too much of the subject becomes untrustworthy, request one img2img donor
-through detail_metabolism_patch.  The donor is aligned and quality-gated, only
-its mid/fine detail is transplanted, and the accepted result becomes a new
-sharp anchor with an identity address map.  It is a soft re-anchor, not a full
-frame replacement.
+Where correspondence is not believable, stale high-frequency detail is
+suppressed. A donor may soft-reanchor the image, but none of these receivers can
+create unseen anatomy; the LivePortrait control exists to test that missing
+learned/canonical prior directly.
 """
 from __future__ import annotations
 
@@ -32,6 +31,7 @@ from anchor_hybrid import (
     confidence_fuse,
     summarize_quality,
 )
+from cycle_consistency import LongRangeCycleMonitor, cycle_trust, project_rail_scalar
 from detail_metabolism import align_donor_to_current, evaluate_donor, transplant_detail
 from fx_core import (
     EFFECT_CLASSES,
@@ -49,14 +49,17 @@ class AnchorHybridLayer(AnttisDeepfakeLayer):
     needs = set(AnttisDeepfakeLayer.needs) | {"detail_donor"}
     blurb = (
         "Keep a pristine generated anchor, but stop trusting its detail where "
-        "the accumulated address field folds, stretches or disagrees with the "
-        "current person mask. Untrusted regions fall back to soft live geometry. "
-        "If correspondence debt grows too large, request one img2img donor, "
-        "transplant only its mid/fine detail, and soft re-anchor the address map."
+        "the address field folds, disagrees with ownership, or fails a long-range "
+        "forward/backward flow cycle. Untrusted regions can fall back to soft live "
+        "geometry. If correspondence debt grows too large, request one img2img "
+        "donor, transplant only its mid/fine detail, and soft-reanchor."
     )
     params = AnttisDeepfakeLayer.params + [
         Param("hybrid_strain_scale", "Address strain penalty", "float", 3.5, 0.5, 10.0),
         Param("hybrid_mask_gain", "Mask disagreement penalty", "float", 3.0, 0.0, 8.0),
+        Param("hybrid_cycle_weight", "Cycle consistency weight", "float", 0.80, 0.0, 1.0),
+        Param("hybrid_cycle_good", "Cycle good (rail px)", "float", 0.45, 0.0, 3.0),
+        Param("hybrid_cycle_bad", "Cycle bad (rail px)", "float", 2.5, 0.25, 10.0),
         Param("hybrid_live_geometry", "Live low geometry", "float", 0.72, 0.0, 1.0),
         Param("hybrid_low_sigma", "Live low radius", "float", 5.0, 1.5, 16.0),
         Param("hybrid_untrusted_detail", "Detail kept when lost", "float", 0.08, 0.0, 0.5),
@@ -92,7 +95,8 @@ class AnchorHybridLayer(AnttisDeepfakeLayer):
         return hud.astype(np.float32) * np.float32(1.0 / 255.0)
 
     @staticmethod
-    def _draw_hud(out: np.ndarray, st: dict, reading: AddressQualityReading, metrics) -> np.ndarray:
+    def _draw_hud(out: np.ndarray, st: dict, reading: AddressQualityReading, metrics,
+                  cycle_reading) -> np.ndarray:
         hud = np.clip(out * 255.0, 0, 255).astype(np.uint8)
         h, w = hud.shape[:2]
         x0, y0 = 12, max(28, h - 58)
@@ -114,8 +118,8 @@ class AnchorHybridLayer(AnttisDeepfakeLayer):
             tail = ""
         txt = (
             f"ANCHOR HYBRID  health {reading.health:.2f} bad {reading.bad_fraction:.2f} "
-            f"strain {reading.strain_mean:.3f} conf {metrics.confidence:.2f} {state} "
-            f"ok={ok} reject={reject}{tail}"
+            f"strain {reading.strain_mean:.3f} cyc {cycle_reading.mean_error:.2f} "
+            f"conf {metrics.confidence:.2f} {state} ok={ok} reject={reject}{tail}"
         )
         cv2.putText(hud, txt, (x0, y0 + 27), cv2.FONT_HERSHEY_SIMPLEX, 0.36,
                     (5, 5, 5), 3, cv2.LINE_AA)
@@ -172,6 +176,7 @@ class AnchorHybridLayer(AnttisDeepfakeLayer):
                 rail = AnchorAddressRail(size=size, device=device)
                 st.update(
                     hybrid_rail=rail,
+                    hybrid_cycle=LongRangeCycleMonitor(),
                     hybrid_size=size,
                     hybrid_device=device,
                     hybrid_person_stamp=-1.0,
@@ -189,9 +194,15 @@ class AnchorHybridLayer(AnttisDeepfakeLayer):
                 composite = np.clip(person_ai * m3 + background * (1.0 - m3), 0.0, 1.0)
                 return self._draw_stage(composite, f"motion rail init failed: {exc}")
 
+        cycle = st.get("hybrid_cycle")
+        if cycle is None:
+            cycle = LongRangeCycleMonitor()
+            st["hybrid_cycle"] = cycle
+
         person_stamp = float(ctx.stamp("person_style"))
         if person_stamp != float(st.get("hybrid_person_stamp", -1.0)):
             rail.reset()
+            cycle.reset()
             st["hybrid_anchor_image"] = np.asarray(person_ai, np.float32).copy()
             st["hybrid_anchor_mask"] = m.copy()
             st["hybrid_person_stamp"] = person_stamp
@@ -205,6 +216,9 @@ class AnchorHybridLayer(AnttisDeepfakeLayer):
             map_x, map_y, metrics = rail.process(
                 source_small, max_displacement=float(self.p("max_motion"))
             )
+            cycle_err_rail, cycle_reading = cycle.update(
+                source_small, bad_px=float(self.p("hybrid_cycle_bad"))
+            )
             carried = fullres_gather_from_rail_map(
                 st["hybrid_anchor_image"], map_x, map_y, meta
             )
@@ -214,7 +228,7 @@ class AnchorHybridLayer(AnttisDeepfakeLayer):
         except Exception as exc:
             st["hybrid_error"] = str(exc)
             composite = np.clip(person_ai * m3 + background * (1.0 - m3), 0.0, 1.0)
-            return self._draw_stage(composite, f"motion rail process failed: {exc}")
+            return self._draw_stage(composite, f"motion/cycle process failed: {exc}")
 
         q, strain, det = address_quality_map(
             map_x, map_y,
@@ -226,6 +240,15 @@ class AnchorHybridLayer(AnttisDeepfakeLayer):
             q, m, warped_anchor_mask,
             disagreement_gain=float(self.p("hybrid_mask_gain")),
         )
+
+        cycle_err = project_rail_scalar(cycle_err_rail, meta, img.shape[:2])
+        cq = cycle_trust(
+            cycle_err,
+            good_px=float(self.p("hybrid_cycle_good")),
+            bad_px=float(self.p("hybrid_cycle_bad")),
+        )
+        cw = float(np.clip(self.p("hybrid_cycle_weight"), 0.0, 1.0))
+        q *= (1.0 - cw) + cw * cq
         q = np.clip(blur(q, 1.5), 0.0, 1.0).astype(np.float32)
         reading = summarize_quality(
             q, m,
@@ -243,6 +266,7 @@ class AnchorHybridLayer(AnttisDeepfakeLayer):
         st["hybrid_detail_corr"] = band_correlation(person, carried, m, band="fine")
         st["hybrid_reading"] = reading
         st["hybrid_metrics"] = metrics
+        st["hybrid_cycle_reading"] = cycle_reading
 
         donor = ctx.map("detail_donor")
         donor_stamp = float(ctx.stamp("detail_donor"))
@@ -275,6 +299,7 @@ class AnchorHybridLayer(AnttisDeepfakeLayer):
                     st["hybrid_anchor_image"] = repaired.copy()
                     st["hybrid_anchor_mask"] = m.copy()
                     rail.reset()
+                    cycle.reset()
                     person = repaired
                     q = np.ones_like(m, np.float32)
                     reading = AddressQualityReading(1.0, 0.0, 0.0, 0.0)
@@ -320,7 +345,7 @@ class AnchorHybridLayer(AnttisDeepfakeLayer):
 
         out = np.clip(front * m3 + background * (1.0 - m3), 0.0, 1.0)
         if bool(self.p("hybrid_show_monitor")):
-            out = self._draw_hud(out, st, reading, metrics)
+            out = self._draw_hud(out, st, reading, metrics, cycle_reading)
         return out
 
 
@@ -344,6 +369,9 @@ def register() -> None:
                 "edge_live": 0.10,
                 "hybrid_strain_scale": 3.5,
                 "hybrid_mask_gain": 3.0,
+                "hybrid_cycle_weight": 0.80,
+                "hybrid_cycle_good": 0.45,
+                "hybrid_cycle_bad": 2.5,
                 "hybrid_live_geometry": 0.72,
                 "hybrid_low_sigma": 5.0,
                 "hybrid_untrusted_detail": 0.08,
