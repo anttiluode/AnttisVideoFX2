@@ -1,0 +1,42 @@
+name: multiscale-life-ci
+
+on:
+  push:
+    paths:
+      - "multiscale_life.py"
+      - "fx_phase_rail_life.py"
+      - "fx_multiscale_life.py"
+      - "test_multiscale_life.py"
+      - ".github/workflows/multiscale-life-ci.yml"
+  pull_request:
+    paths:
+      - "multiscale_life.py"
+      - "fx_phase_rail_life.py"
+      - "fx_multiscale_life.py"
+      - "test_multiscale_life.py"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install numpy opencv-python-headless
+      - run: python -m unittest test_multiscale_life -v
+      - name: Registration smoke test
+        run: |
+          python - <<'PY'
+          import fx_multiscale_life
+          from fx_core import EFFECTS_BY_NAME, PRESETS
+          assert "MultiscaleLifeLayer" in EFFECTS_BY_NAME
+          assert "Antti Multiscale Life" in PRESETS
+          fx = EFFECTS_BY_NAME["MultiscaleLifeLayer"]()
+          assert fx.p("life_fine") == 8
+          assert fx.p("life_medium") == 25
+          assert fx.p("life_low") == 60
+          assert fx.p("life_coarse") == 100
+          print("multiscale life registration PASS")
+          PY
