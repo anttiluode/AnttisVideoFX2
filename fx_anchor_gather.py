@@ -1,7 +1,7 @@
 """Source-anchored gather sibling effect for AnttisVideoFX2.
 
-The generated person is immutable appearance memory.  PhaseRail's Gabor bank is
-used only to estimate incremental motion.  Those increments are composed into a
+The generated person is immutable appearance memory. PhaseRail's Gabor bank is
+used only to estimate incremental motion. Those increments are composed into a
 current->anchor address field, and every displayed frame samples the original
 sharp generated person exactly once.
 
@@ -30,6 +30,9 @@ from fx_core import (
 class AnchorGatherLayer(AnttisDeepfakeLayer):
     name = "Antti Anchor Gather"
     group = "layer"
+    # Explicit rather than merely inherited: this is also a useful declaration
+    # for debugging the worker request path.
+    needs = {"mask", "person_style", "background_style"}
     blurb = (
         "Do not carry appearance through time. Carry only a backward address "
         "field and gather every frame from the pristine generated person. "
@@ -58,22 +61,44 @@ class AnchorGatherLayer(AnttisDeepfakeLayer):
                     (255, 255, 255), 1, cv2.LINE_AA)
         return hud.astype(np.float32) * np.float32(1.0 / 255.0)
 
+    @staticmethod
+    def _draw_stage(out: np.ndarray, text: str) -> np.ndarray:
+        """Visible startup/error diagnostic; silent pass-through was impossible to debug."""
+        hud = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+        h, w = hud.shape[:2]
+        x, y = 12, max(30, h - 38)
+        label = f"ANCHOR GATHER — {text}"
+        # Keep long Python errors on-screen but bounded to the window.
+        if len(label) > 105:
+            label = label[:102] + "..."
+        cv2.rectangle(hud, (x - 4, y - 19), (min(w - 5, x + 690), y + 8), (0, 0, 0), -1)
+        cv2.putText(hud, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (0, 210, 255), 1, cv2.LINE_AA)
+        return hud.astype(np.float32) * np.float32(1.0 / 255.0)
+
     def apply(self, img, ctx):
+        # Read every prerequisite first so a missing stage can identify itself.
         mask = ctx.mask()
-        if mask is None:
-            return img
         person_ai = ctx.map("person_style")
         background_ai = ctx.map("background_style")
-        if person_ai is None and background_ai is None:
-            return img
+
+        if mask is None:
+            return self._draw_stage(img, "waiting for segmentation mask")
+        if person_ai is None or background_ai is None:
+            missing = []
+            if person_ai is None:
+                missing.append("person_style")
+            if background_ai is None:
+                missing.append("background_style")
+            return self._draw_stage(img, "waiting for " + " + ".join(missing))
 
         m = self._ownership(mask, int(self.p("mask_expand")), float(self.p("mask_feather")))
         if self.p("show_mask"):
             return np.repeat(m[..., None], 3, axis=2)
         m3 = m[..., None]
 
-        person_target = person_ai if person_ai is not None else img
-        background = background_ai if background_ai is not None else img
+        person_target = person_ai
+        background = background_ai
         background = img + (background - img) * float(self.p("background_mix"))
         background = self._move_background(
             background, self.p("back_x"), self.p("back_y"), self.p("back_zoom")
@@ -100,13 +125,13 @@ class AnchorGatherLayer(AnttisDeepfakeLayer):
                 )
             except Exception as exc:
                 st["anchor_error"] = str(exc)
-                front = person_target
-                return np.clip(front * m3 + background * (1.0 - m3), 0.0, 1.0)
+                composite = np.clip(person_target * m3 + background * (1.0 - m3), 0.0, 1.0)
+                return self._draw_stage(composite, f"motion rail init failed: {exc}")
 
         stamp = float(ctx.stamp("person_style"))
         if stamp != float(st.get("anchor_person_stamp", -1.0)):
             rail.reset()
-            # Immutable full-resolution appearance source.  It is never replaced
+            # Immutable full-resolution appearance source. It is never replaced
             # by a carried/rendered frame in this effect.
             st["anchor_image"] = np.asarray(person_target, np.float32).copy()
             st["anchor_person_stamp"] = stamp
@@ -120,10 +145,10 @@ class AnchorGatherLayer(AnttisDeepfakeLayer):
             carried = fullres_gather_from_rail_map(st["anchor_image"], map_x, map_y, meta)
         except Exception as exc:
             st["anchor_error"] = str(exc)
-            carried = person_target
-            metrics = None
+            composite = np.clip(person_target * m3 + background * (1.0 - m3), 0.0, 1.0)
+            return self._draw_stage(composite, f"motion rail process failed: {exc}")
 
-        # Optional very-low-frequency borrowing from the camera.  Default is
+        # Optional very-low-frequency borrowing from the camera. Default is
         # zero so the first test isolates source-anchored gathering itself.
         low_mix = float(self.p("anchor_live_low"))
         if low_mix > 0.0:
@@ -132,7 +157,7 @@ class AnchorGatherLayer(AnttisDeepfakeLayer):
             carry_low = blur(carried, sigma)
             carried = np.clip(carried + low_mix * (live_low - carry_low), 0.0, 1.0)
 
-        if bool(self.p("show_address_map")) and metrics is not None:
+        if bool(self.p("show_address_map")):
             # Visualize displacement magnitude from the low-resolution field.
             H, W = map_x.shape
             yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
@@ -152,7 +177,7 @@ class AnchorGatherLayer(AnttisDeepfakeLayer):
             front = front * (1.0 - edge * rescue) + img * (edge * rescue)
 
         out = np.clip(front * m3 + background * (1.0 - m3), 0.0, 1.0)
-        if bool(self.p("show_address")) and metrics is not None and not bool(self.p("show_address_map")):
+        if bool(self.p("show_address")) and not bool(self.p("show_address_map")):
             out = self._draw_hud(out, metrics)
         return out
 
